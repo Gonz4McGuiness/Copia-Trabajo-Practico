@@ -58,7 +58,7 @@ export async function registrarPago(params: RegistrarPagoParams): Promise<{
       })
       .returning()
 
-    const nuevoSaldo = await calcularSaldoCliente(params.clienteId)
+    const nuevoSaldo = await calcularSaldoCliente(params.clienteId, tx)
 
     return {
       pago: nuevoPago,

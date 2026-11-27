@@ -1,5 +1,5 @@
 import { and, eq, like, or } from 'drizzle-orm'
-import { db } from '../db'
+import { db, DbTx } from '../db'
 import { clientes, facturas, pagos, Cliente, NuevoCliente } from '../db/schema'
 import { ApiError } from './api-error'
 
@@ -8,9 +8,10 @@ export interface ClienteConSaldo extends Cliente {
   creditoDisponibleCentavos: number | null
 }
 
-export async function calcularSaldoCliente(clienteId: number): Promise<number> {
+export async function calcularSaldoCliente(clienteId: number, tx?: DbTx): Promise<number> {
+  const conn = tx ?? db
   // Suma de facturas en cuenta corriente emitidas (cargos)
-  const facturasCC = await db
+  const facturasCC = await conn
     .select({ total: facturas.totalCentavos })
     .from(facturas)
     .where(
@@ -24,7 +25,7 @@ export async function calcularSaldoCliente(clienteId: number): Promise<number> {
   const totalCargos = facturasCC.reduce((acc, f) => acc + f.total, 0)
 
   // Suma de pagos realizados (abonos)
-  const pagosCliente = await db
+  const pagosCliente = await conn
     .select({ importe: pagos.importeCentavos })
     .from(pagos)
     .where(eq(pagos.clienteId, clienteId))

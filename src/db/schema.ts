@@ -146,6 +146,21 @@ export const productosRelations = relations(productos, ({ one, many }) => ({
   detallesFactura: many(detallesFactura)
 }))
 
+export const movimientosStockRelations = relations(movimientosStock, ({ one }) => ({
+  producto: one(productos, {
+    fields: [movimientosStock.productoId],
+    references: [productos.id]
+  }),
+  usuario: one(usuarios, {
+    fields: [movimientosStock.usuarioId],
+    references: [usuarios.id]
+  }),
+  factura: one(facturas, {
+    fields: [movimientosStock.facturaId],
+    references: [facturas.id]
+  })
+}))
+
 export const clientesRelations = relations(clientes, ({ many }) => ({
   facturas: many(facturas),
   pagos: many(pagos)

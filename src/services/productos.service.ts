@@ -1,5 +1,5 @@
 import { and, eq, lte, or, sql, like } from 'drizzle-orm'
-import { db, ejecutarTransaccion } from '../db'
+import { db, ejecutarTransaccion, DbTx } from '../db'
 import { productos, movimientosStock, Producto, NuevoProducto, MovimientoStock } from '../db/schema'
 import { ApiError } from './api-error'
 
@@ -212,68 +212,69 @@ export async function moverStock(
   origen: 'INICIAL' | 'MANUAL' | 'VENTA' | 'ANULACION',
   usuarioId: number,
   facturaId?: number,
-  tx?: any
+  tx?: DbTx
 ): Promise<MovimientoStock> {
   if (cantidad <= 0) {
     throw new ApiError(400, 'CANTIDAD_INVALIDA', 'La cantidad del movimiento debe ser mayor a cero')
   }
 
   const delta = tipo === 'INGRESO' ? cantidad : -cantidad
-  const ejecutar = async (clienteTx: any) => {
+  const ejecutar = async (clienteTx: DbTx) => {
+    // Obtenemos producto para control de concurrencia y validación de existencia
+    const [prod] = await clienteTx
+      .select()
+      .from(productos)
+      .where(eq(productos.id, productoId))
+      .limit(1)
 
-    return await db.transaction(async (tx) => {
-      // Obtenemos producto para control de concurrencia y validación de existencia
-      const [prod] = await tx
-        .select()
-        .from(productos)
-        .where(eq(productos.id, productoId))
-        .limit(1)
+    if (!prod) {
+      throw new ApiError(404, 'PRODUCTO_NO_ENCONTRADO', 'Producto no encontrado')
+    }
 
-      if (!prod) {
-        throw new ApiError(404, 'PRODUCTO_NO_ENCONTRADO', 'Producto no encontrado')
-      }
+    const nuevaExistencia = prod.existencia + delta
 
-      const nuevaExistencia = prod.existencia + delta
-
-      if (nuevaExistencia < 0) {
-        throw new ApiError(
-          400,
-          'STOCK_INSUFICIENTE',
-          `Stock insuficiente para "${prod.descripcion}". Disponible: ${prod.existencia}, requerido: ${cantidad}`,
-          {
-            productoId,
-            codigo: prod.codigo,
-            descripcion: prod.descripcion,
-            existenciaActual: prod.existencia,
-            cantidadRequerida: cantidad
-          }
-        )
-      }
-
-      // Actualizamos existencia
-      await tx
-        .update(productos)
-        .set({ existencia: nuevaExistencia })
-        .where(eq(productos.id, productoId))
-
-      // Registramos movimiento inmutable
-      const [mov] = await tx
-        .insert(movimientosStock)
-        .values({
-          fecha: new Date().toISOString(),
+    if (nuevaExistencia < 0) {
+      throw new ApiError(
+        400,
+        'STOCK_INSUFICIENTE',
+        `Stock insuficiente para "${prod.descripcion}". Disponible: ${prod.existencia}, requerido: ${cantidad}`,
+        {
           productoId,
-          tipo,
-          cantidad,
-          existenciaResultante: nuevaExistencia,
-          motivo,
-          origen,
-          usuarioId,
-          facturaId: facturaId ?? null
-        })
-        .returning()
+          codigo: prod.codigo,
+          descripcion: prod.descripcion,
+          existenciaActual: prod.existencia,
+          cantidadRequerida: cantidad
+        }
+      )
+    }
 
-      return mov
-    })
+    // Actualizamos existencia
+    await clienteTx
+      .update(productos)
+      .set({ existencia: nuevaExistencia })
+      .where(eq(productos.id, productoId))
+
+    // Registramos movimiento inmutable
+    const [mov] = await clienteTx
+      .insert(movimientosStock)
+      .values({
+        fecha: new Date().toISOString(),
+        productoId,
+        tipo,
+        cantidad,
+        existenciaResultante: nuevaExistencia,
+        motivo,
+        origen,
+        usuarioId,
+        facturaId: facturaId ?? null
+      })
+      .returning()
+
+    return mov
+  }
+
+  if (tx) {
+    return await ejecutar(tx)
   }
 
   return await ejecutarTransaccion(async (innerTx) => {
