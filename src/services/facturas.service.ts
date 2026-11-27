@@ -1,5 +1,5 @@
 import { and, desc, eq, gte, lte, max } from 'drizzle-orm'
-import { db, ejecutarTransaccion } from '../db'
+import { db, client, ejecutarTransaccion, esErrorDeConcurrencia } from '../db'
 import { facturas, detallesFactura, Factura, DetalleFactura, productos } from '../db/schema'
 import { ApiError } from './api-error'
 import { moverStock } from './productos.service'
@@ -167,73 +167,133 @@ export async function crearFactura(params: CrearFacturaParams) {
     clienteFinalDoc = cliente.documento
   }
 
-  // Transacción atómica de facturación + descarga de stock
-  return await ejecutarTransaccion(async (tx) => {
-    // 1. Obtener siguiente número de factura correlativo
-    const [maxNum] = await tx
-      .select({ maximo: max(facturas.numero) })
-      .from(facturas)
-
-    const siguienteNumero = (maxNum?.maximo ?? 0) + 1
-    const ahora = new Date().toISOString()
-
-    // 2. Insertar cabecera de factura
-    const [facturaInsertada] = await tx
-      .insert(facturas)
-      .values({
-        numero: siguienteNumero,
-        fecha: ahora,
-        usuarioId: params.usuarioId,
-        clienteId: params.clienteId || null,
-        clienteNombre: clienteFinalNombre,
-        clienteDocumento: clienteFinalDoc,
-        formaPago: params.formaPago,
+  // Transacción atómica en un solo batch 'write' (evita timeouts de streams interactivos en Turso/Vercel)
+  const ahora = new Date().toISOString()
+  const statements = [
+    {
+      sql: `INSERT INTO facturas (
+        numero, fecha, usuario_id, cliente_id, cliente_nombre, cliente_documento,
+        forma_pago, total_centavos, pago_monto_centavos, vuelto_centavos,
+        tarjeta_tipo, tarjeta_marca, tarjeta_ultimos_4, estado
+      ) VALUES (
+        (SELECT COALESCE(MAX(numero), 0) + 1 FROM facturas),
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'EMITIDA'
+      ) RETURNING *`,
+      args: [
+        ahora,
+        params.usuarioId,
+        params.clienteId || null,
+        clienteFinalNombre,
+        clienteFinalDoc,
+        params.formaPago,
         totalCentavos,
         pagoMontoCentavos,
         vueltoCentavos,
         tarjetaTipo,
         tarjetaMarca,
-        tarjetaUltimos4,
-        estado: 'EMITIDA'
-      })
-      .returning()
+        tarjetaUltimos4
+      ]
+    },
+    ...itemsAProcesar.flatMap((item) => [
+      {
+        sql: `INSERT INTO detalles_factura (
+          factura_id, producto_id, descripcion, cantidad, precio_unitario_centavos, subtotal_centavos
+        ) VALUES (
+          (SELECT MAX(id) FROM facturas), ?, ?, ?, ?, ?
+        ) RETURNING *`,
+        args: [
+          item.productoId,
+          item.descripcion,
+          item.cantidad,
+          item.precioUnitarioCentavos,
+          item.subtotalCentavos
+        ]
+      },
+      {
+        sql: `UPDATE productos
+          SET existencia = CASE WHEN existencia >= ? THEN existencia - ? ELSE NULL END
+          WHERE id = ?`,
+        args: [item.cantidad, item.cantidad, item.productoId]
+      },
+      {
+        sql: `INSERT INTO movimientos_stock (
+          fecha, producto_id, tipo, cantidad, existencia_resultante, motivo, origen, usuario_id, factura_id
+        ) VALUES (
+          ?, ?, 'EGRESO', ?,
+          (SELECT existencia FROM productos WHERE id = ?),
+          'Venta en Factura #' || printf('%08d', (SELECT numero FROM facturas WHERE id = (SELECT MAX(id) FROM facturas))),
+          'VENTA', ?, (SELECT MAX(id) FROM facturas)
+        )`,
+        args: [ahora, item.productoId, item.cantidad, item.productoId, params.usuarioId]
+      }
+    ])
+  ]
 
-    // 3. Insertar renglones y descargar stock
-    const detallesInsertados: DetalleFactura[] = []
-
-    for (const item of itemsAProcesar) {
-      const [det] = await tx
-        .insert(detallesFactura)
-        .values({
-          facturaId: facturaInsertada.id,
-          productoId: item.productoId,
-          descripcion: item.descripcion,
-          cantidad: item.cantidad,
-          precioUnitarioCentavos: item.precioUnitarioCentavos,
-          subtotalCentavos: item.subtotalCentavos
-        })
-        .returning()
-
-      detallesInsertados.push(det)
-
-      // Invariante de stock: mover stock mediante función central
-      await moverStock(
-        item.productoId,
-        item.cantidad,
-        'EGRESO',
-        `Venta en Factura #${String(siguienteNumero).padStart(8, '0')}`,
-        'VENTA',
-        params.usuarioId,
-        facturaInsertada.id,
-        tx
-      )
+  let batchResults
+  let ultimoError: unknown
+  for (let intento = 0; intento <= 5; intento++) {
+    try {
+      batchResults = await client.batch(statements, 'write')
+      break
+    } catch (err) {
+      ultimoError = err
+      const msg = String((err as { message?: string })?.message || '').toLowerCase()
+      if (msg.includes('not null constraint failed') && msg.includes('productos.existencia')) {
+        throw new ApiError(400, 'STOCK_INSUFICIENTE', 'Stock insuficiente para completar la venta')
+      }
+      if (esErrorDeConcurrencia(err) && intento < 5) {
+        const esperaMs = 60 * Math.pow(2, intento) + Math.floor(Math.random() * 50)
+        await new Promise((resolve) => setTimeout(resolve, esperaMs))
+        continue
+      }
+      throw err
     }
+  }
 
+  if (!batchResults) {
+    throw ultimoError
+  }
+
+  const fRow = batchResults[0].rows[0] as Record<string, any>
+  const facturaInsertada: Factura = {
+    id: Number(fRow.id),
+    numero: Number(fRow.numero),
+    fecha: String(fRow.fecha),
+    usuarioId: Number(fRow.usuario_id),
+    clienteId: fRow.cliente_id !== null ? Number(fRow.cliente_id) : null,
+    clienteNombre: String(fRow.cliente_nombre),
+    clienteDocumento: fRow.cliente_documento !== null ? String(fRow.cliente_documento) : null,
+    formaPago: fRow.forma_pago as Factura['formaPago'],
+    totalCentavos: Number(fRow.total_centavos),
+    pagoMontoCentavos: fRow.pago_monto_centavos !== null ? Number(fRow.pago_monto_centavos) : null,
+    vueltoCentavos: fRow.vuelto_centavos !== null ? Number(fRow.vuelto_centavos) : null,
+    tarjetaTipo: (fRow.tarjeta_tipo as Factura['tarjetaTipo']) ?? null,
+    tarjetaMarca: (fRow.tarjeta_marca as Factura['tarjetaMarca']) ?? null,
+    tarjetaUltimos4: fRow.tarjeta_ultimos_4 !== null ? String(fRow.tarjeta_ultimos_4) : null,
+    estado: fRow.estado as Factura['estado'],
+    motivoAnulacion: fRow.motivo_anulacion !== null ? String(fRow.motivo_anulacion) : null,
+    anuladaEn: fRow.anulada_en !== null ? String(fRow.anulada_en) : null,
+    anuladaPorUsuarioId:
+      fRow.anulada_por_usuario_id !== null ? Number(fRow.anulada_por_usuario_id) : null
+  }
+
+  const detallesInsertados: DetalleFactura[] = itemsAProcesar.map((_, idx) => {
+    const dRow = batchResults![1 + idx * 3].rows[0] as Record<string, any>
     return {
-      factura: facturaInsertada,
-      detalles: detallesInsertados
+      id: Number(dRow.id),
+      facturaId: Number(dRow.factura_id),
+      productoId: Number(dRow.producto_id),
+      descripcion: String(dRow.descripcion),
+      cantidad: Number(dRow.cantidad),
+      precioUnitarioCentavos: Number(dRow.precio_unitario_centavos),
+      subtotalCentavos: Number(dRow.subtotal_centavos)
     }
   })
+
+  return {
+    factura: facturaInsertada,
+    detalles: detallesInsertados
+  }
 }
 
 export async function anularFactura(
